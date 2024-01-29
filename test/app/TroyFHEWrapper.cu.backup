@@ -1,0 +1,447 @@
+#include "TroyFHEWrapper.h"
+
+#include "../../app/LinearHelper.cuh"
+
+#include <sstream>
+#include <cassert>
+
+using namespace troyn;
+using namespace std;
+
+class FHEUtil {
+
+    Encryptor* encryptor;
+    Decryptor* decryptor;
+    Evaluator* evaluator;
+    SEALContext* context;
+    RelinKeys rlk;
+    PublicKey pk;
+    GaloisKeys gk;
+    GaloisKeys autok;
+    KeyGenerator* keygen;
+    EncryptionParameters parms;
+
+    vector<ParmsID> parmIDs;
+
+    BatchEncoder* encoder;
+    size_t slotCount;
+    int dataBound;
+    double delta;
+    uint64_t modulus;
+
+public:
+
+    FHEUtil(size_t polyModulusDegree, vector<int> qs, int dataBound, uint64_t plainModulus, uint64_t scale, bool isPriv = true);
+    ~FHEUtil() {
+        // delete keygen;
+        // delete encryptor;
+        // delete decryptor;
+        // delete evaluator;
+        // delete encoder;
+        // delete context;
+    }
+    vector<uint64_t> randomVector(size_t count = 0, uint64_t data_bound = 0);
+    std::vector<uint64_t> plainMatMul(const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, size_t dim0, size_t dim1, size_t dim2);
+    void test_ss_Encode(size_t dim);
+    string serialize_pub_key(size_t& pk_size, size_t& gk_size, size_t& autok_size) const;
+    void deserialize_pub_key(const string& buf, size_t pk_size_, size_t gk_size_, size_t autok_size_);
+
+    std::string encrypt(const std::vector<uint64_t>& plain);
+    std::string encrypt(const std::vector<std::vector<uint64_t>>& plain, size_t dim0, size_t dim1, size_t dim2, bool isLeft = true);
+    std::vector<std::vector<uint64_t>> mat_mul_and_subtract_random(std::string& cipher, const std::vector<std::vector<uint64_t>>& operand, size_t dim0, size_t dim1, size_t dim2, bool isLeft = true);
+    std::vector<uint64_t> subtract_random(std::string& cipher, size_t dim);
+    std::vector<std::vector<uint64_t>> decrypt(const std::string& cipher, size_t dim0, size_t dim1, size_t dim2, bool isLeft = true);
+    std::vector<uint64_t> decrypt(const std::string& cipher, size_t dim);
+};
+
+FHEUtil::FHEUtil(size_t polyModulusDegree, vector<int> qs, int dataBound, uint64_t plainModulus, uint64_t scale, bool isPriv) {
+    KernelProvider::initialize();
+    slotCount = polyModulusDegree;
+    this->dataBound = dataBound;
+    this->delta = scale;
+    parms = EncryptionParameters(SchemeType::bfv);
+    parms.setPolyModulusDegree(polyModulusDegree);
+    parms.setPlainModulus(plainModulus);
+    printf("plainModulus %lu \n", plainModulus);
+    modulus = plainModulus;
+    parms.setCoeffModulus(CoeffModulus::Create(polyModulusDegree, qs));
+    context = new SEALContext(parms, true, SecurityLevel::none);
+
+    encoder = new BatchEncoder(*context);
+    evaluator = new Evaluator(*context);
+
+    if (isPriv) {
+        // printf("HHHHHHHHHHH\n");
+        keygen = new KeyGenerator(*context);
+        keygen->createPublicKey(pk);
+        keygen->createRelinKeys(rlk);
+        keygen->createGaloisKeys(gk);
+        autok = keygen->createAutomorphismKeys();     
+        encryptor = new Encryptor(*context, pk);
+        encryptor->setSecretKey(keygen->secretKey()); 
+        decryptor = new Decryptor(*context, keygen->secretKey());  
+    }
+
+    parmIDs.clear();
+    std::shared_ptr<const SEALContext::ContextDataCuda> cd = context->firstContextData();
+    while (cd) {
+        parmIDs.push_back(cd->parmsID());
+        cd = cd->nextContextData();
+    }
+}
+
+vector<uint64_t> FHEUtil::randomVector(size_t count, uint64_t data_bound) {
+    if (count == 0) count = slotCount;
+    if (data_bound == 0) data_bound = dataBound;
+    vector<uint64_t> input(count, 0.0);
+    for (size_t i = 0; i < count; i++)
+    {
+        input[i] = ((((uint64_t)(rand())) << 32) + ((uint64_t)(rand()))) % data_bound;
+    }
+    return input;
+}
+
+std::vector<uint64_t> FHEUtil::plainMatMul(const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, size_t dim0, size_t dim1, size_t dim2) {
+    // plaintext computation
+    auto mod = parms.plainModulus().value();
+    std::vector<uint64_t> C(dim0 * dim2, 0);
+    for (size_t i = 0; i < dim0; i++) {
+        for (size_t j = 0; j < dim1; j++) {
+            for (size_t k = 0; k < dim2; k++) {
+                C[i * dim2 + k] += A[i * dim1 + j] * B[j * dim2 + k];
+                C[i * dim2 + k] %= mod;      
+            }
+        }
+    }        
+    return C;
+}
+
+void FHEUtil::test_ss_Encode(size_t dim) {
+    
+    auto mod = parms.plainModulus().value();
+    auto A = randomVector(dim, mod);
+    auto A_0 = randomVector(dim, mod);
+    auto A_1 = std::vector<uint64_t>(dim, 0); 
+    // for (int i = 0; i < dim; ++i) A_1[i] = (A[i] - A_0[i]) % mod; 
+    Plaintext A_0_Encoded, A_Encoded;
+
+    encoder->encodePolynomial(A_0, A_0_Encoded);
+    encoder->encodePolynomial(A, A_Encoded);
+    auto A_Enc = encryptor->encryptSymmetric(A_Encoded);
+    Ciphertext A_1_Enc;
+    evaluator->subPlain(A_Enc, A_0_Encoded, A_1_Enc);
+    Plaintext A_1_Encoded;
+    decryptor->decrypt(A_1_Enc, A_1_Encoded);
+    encoder->decodePolynomial(A_1_Encoded, A_1);
+
+    // printf("mod %lu\n", mod);
+    // printf("A_1------\n");
+    // for (int i = 0; i < A_1.size(); ++i) printf("%lu ", A_1[i]);
+    // printf("------\n");
+
+    // comparison
+    uint64_t diff = 0;
+    for (size_t i = 0; i < dim; i++) {
+        uint64_t d = std::abs<long long>(A[i] - ((A_0[i] + (A_1[i] % mod)) % mod));
+        if (d > diff) diff = d;
+    }
+    std::cout << "Difference = " << diff << std::endl;
+
+}
+
+string FHEUtil::serialize_pub_key(size_t& pk_size, size_t& gk_size, size_t& autok_size) const {
+    stringstream os;
+    this->pk.save(os);
+    uint64_t pk_size_ = os.tellp();
+    this->gk.save(os);
+    uint64_t gk_size_ = (uint64_t)os.tellp() - pk_size_;
+    this->autok.save(os);
+    uint64_t autok_size_ = (uint64_t)os.tellp() - pk_size_ - gk_size_;
+    // os.read((char*)buf, pk_size_ + gk_size_);
+    pk_size = pk_size_;
+    gk_size = gk_size_;
+    autok_size = autok_size_;
+    return os.str();
+}
+
+void FHEUtil::deserialize_pub_key(const string& buf, size_t pk_size_, size_t gk_size_, size_t autok_size_) {
+    // Deserialize
+    stringstream is;
+    size_t bufSize = buf.length();
+    char* charBuf = (char*)buf.c_str(); 
+    is.write(charBuf, pk_size_);
+    this->pk.load(is);
+    is.write((char*)charBuf + pk_size_, gk_size_);
+    this->gk.load(is);
+    is.write((char*)charBuf + pk_size_ + gk_size_, autok_size_);
+    this->autok.load(is);
+
+    this->encryptor = new Encryptor(*this->context, this->pk);
+}
+
+std::string FHEUtil::encrypt(const std::vector<uint64_t>& plain) {
+    Plaintext encoded;
+    encoder->encodePolynomial(plain, encoded);
+    auto enc = encryptor->encryptSymmetric(encoded);
+    ostringstream sout;
+    enc.save(sout);
+    return sout.str();
+}
+
+std::string FHEUtil::encrypt(const std::vector<std::vector<uint64_t>>& plain, size_t dim0, size_t dim1, size_t dim2, bool isLeft) {
+    int objective;
+    vector<uint64_t> plainFlat;
+    if (isLeft) {
+        objective = 0;
+        assert(plain.size() == dim0);
+        assert(plain[0].size() == dim1);
+        for (int i = 0; i < dim0; ++i) {
+            plainFlat.insert(plainFlat.end(), plain[i].begin(), plain[i].end());
+        }
+    } else {
+        objective = 1;
+        assert(plain.size() == dim1);
+        assert(plain[0].size() == dim2);
+        for (int i = 0; i < dim1; ++i) {
+            plainFlat.insert(plainFlat.end(), plain[i].begin(), plain[i].end());
+        }
+    }
+    printf("-----> encoded plain B\n");
+    for (int i = 0; i < plainFlat.size(); ++i) printf("%lu ", plainFlat[i]);
+    printf("<-----\n");
+    LinearHelper::MatmulHelper helper(dim0, dim1, dim2, slotCount, objective, true);
+    LinearHelper::Plain2d encoded;
+    LinearHelper::Cipher2d enc;
+    if (isLeft) {
+        encoded = helper.encodeInputs(*encoder, plainFlat.data());
+        enc = encoded.encrypt(*encryptor);
+    } else {
+        encoded = helper.encodeWeights(*encoder, plainFlat.data());
+        printf("-----> decoded encoded \n");
+        for (size_t i = 0; i < encoded.data.size(); i++) {
+            for (size_t j = 0; j < encoded.data[i].size(); j++) {
+                std::cout << "decoded[" << i << "][" << j << "] = ";
+                std::vector<uint64_t> v; encoder->decodePolynomial(encoded.data[i][j], v); 
+                for (int k = 0; k < v.size(); ++k) {
+                    if (v[k] != 0) printf("%lu ", v[k]);
+                }
+                printf("\n");
+            }
+        }
+        printf("<----- decoded encoded \n");
+        enc = encoded.encrypt(*encryptor);
+    }
+
+    printf("-----> decrypt encoded \n");
+    for (size_t i = 0; i < enc.data.size(); i++) {
+        for (size_t j = 0; j < enc.data[i].size(); j++) {
+            std::cout << "enc[" << i << "][" << j << "] = ";
+            Plaintext p; decryptor->decrypt(enc.data[i][j], p);
+            std::vector<uint64_t> v; encoder->decodePolynomial(p, v); 
+            for (int k = 0; k < v.size(); ++k) {
+                if (v[k] != 0) printf("%lu ", v[k]);
+            }
+            printf("\n");
+        }
+    }
+    printf("<----- decrypt encoded \n");
+
+    ostringstream sout;
+    enc.save(sout);
+    return sout.str();
+}
+
+std::vector<std::vector<uint64_t>> FHEUtil::mat_mul_and_subtract_random(std::string& cipher, const std::vector<std::vector<uint64_t>>& operand, size_t dim0, size_t dim1, size_t dim2, bool isLeft) {
+    istringstream sin(cipher); 
+    int objective;
+    auto mod = parms.plainModulus().value();
+    vector<uint64_t> randomFlat = randomVector(dim0 * dim2, mod);
+    vector<uint64_t> negRandomFlat = std::vector<uint64_t>(dim0 * dim2, 0);
+    for (int i = 0; i < randomFlat.size(); ++i) negRandomFlat[i] = (-randomFlat[i]) % mod;
+    vector<uint64_t> operandFlat;
+    if (isLeft) {
+        objective = 0;
+        assert(operand.size() == dim1);
+        assert(operand[0].size() == dim2);
+        for (int i = 0; i < dim1; ++i) {
+            operandFlat.insert(operandFlat.end(), operand[i].begin(), operand[i].end());
+        }
+    } else {
+        objective = 1;
+        assert(operand.size() == dim0);
+        assert(operand[0].size() == dim1);
+        for (int i = 0; i < dim0; ++i) {
+            operandFlat.insert(operandFlat.end(), operand[i].begin(), operand[i].end());
+        }
+    }
+    LinearHelper::MatmulHelper helper(dim0, dim1, dim2, slotCount, objective, true);
+    auto enc = LinearHelper::Cipher2d();
+    enc.load(sin, *context);
+    LinearHelper::Plain2d encoded_operand;
+    LinearHelper::Cipher2d multed;
+    auto encoded_negRandomFlat = helper.encodeOutputs(*encoder, negRandomFlat.data());
+    if (isLeft) {
+        encoded_operand = helper.encodeWeights(*encoder, operandFlat.data());
+        multed = helper.matmul(*evaluator, enc, encoded_operand); 
+        multed.modSwitchToNext(*evaluator);
+        multed = helper.packOutputs(*evaluator, autok, multed);
+        multed.addPlainInplace(*evaluator, encoded_negRandomFlat);
+    } else {
+        encoded_operand = helper.encodeInputs(*encoder, operandFlat.data());
+        multed = helper.matmulReverse(*evaluator, encoded_operand, enc);
+        multed.modSwitchToNext(*evaluator);
+        multed = helper.packOutputs(*evaluator, autok, multed);
+        multed.addPlainInplace(*evaluator, encoded_negRandomFlat); 
+    }    
+    ostringstream sout;
+    helper.serializeOutputs(*evaluator, multed, sout);
+    cipher = sout.str();
+
+    vector<vector<uint64_t>> random(dim0, std::vector<uint64_t>(dim2, 0));
+    for (int i = 0; i < dim0; ++i) {
+        for (int j = 0; j < dim2; ++j) {
+            random[i][j] = randomFlat[i*dim2 + j];
+        }
+    } 
+
+    return random;
+}
+
+std::vector<uint64_t> FHEUtil::subtract_random(std::string& cipher, size_t dim) {
+    istringstream sin(cipher);
+    Ciphertext enc;
+    enc.load(sin);
+    auto mod = parms.plainModulus().value();
+    vector<uint64_t> random = randomVector(dim, mod);
+    Plaintext encoded_random;
+    encoder->encodePolynomial(random, encoded_random);
+    Ciphertext result;
+    evaluator->subPlainInplace(enc, encoded_random);
+    ostringstream sout;
+    result.save(sout);
+    cipher = sout.str();
+
+    return random;
+}
+
+std::vector<std::vector<uint64_t>> FHEUtil::decrypt(const std::string& cipher, size_t dim0, size_t dim1, size_t dim2, bool isLeft) {
+    istringstream sin(cipher); 
+    int objective;
+    auto mod = parms.plainModulus().value();
+    if (isLeft) {
+        objective = 0;
+    } else {
+        objective = 1;
+    }
+    LinearHelper::MatmulHelper helper(dim0, dim1, dim2, slotCount, objective, true);
+    auto enc = helper.deserializeOutputs(*evaluator, sin);
+    auto dec_flat = helper.decryptOutputs(*encoder, *decryptor, enc);
+    assert(dec_flat.size() == dim0 * dim2);
+    std::vector<std::vector<uint64_t>> dec(dim0, std::vector<uint64_t>(dim2, 0));
+    for (int i = 0; i < dim0; ++i) {
+        for (int j = 0; j < dim2; ++j) {
+            dec[i][j] = dec_flat[i*dim2 + j];
+        }
+    }     
+
+    return dec;
+}
+
+std::vector<uint64_t> FHEUtil::decrypt(const std::string& cipher, size_t dim) {
+    auto mod = parms.plainModulus().value();
+    istringstream sin(cipher); 
+    Ciphertext enc;
+    enc.load(sin);    
+    Plaintext plain_encoded;
+    decryptor->decrypt(enc, plain_encoded);
+    auto plain = std::vector<uint64_t>(dim, 0); 
+    encoder->decodePolynomial(plain_encoded, plain);   
+    assert(plain.size() == dim);
+    for (int i = 0; i < dim; ++i) plain[i] = plain[i] % mod;
+
+    return plain; 
+}
+
+FHEWrapper::FHEWrapper(bool isPriv) {
+    KernelProvider::initialize();
+    this->fheUtil = (void*)(new FHEUtil(8192, {60, 60, 60}, 16, 1ul<<32, 1ul<<8, isPriv));
+    if (isPriv) ((FHEUtil*)this->fheUtil)->test_ss_Encode(1000);
+}
+
+FHEWrapper::~FHEWrapper() {
+    KernelProvider::initialize();
+    delete ((FHEUtil*)this->fheUtil);
+}
+
+std::vector<uint64_t> FHEWrapper::plainMatMul(const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, size_t dim0, size_t dim1, size_t dim2) {
+    KernelProvider::initialize();
+    return ((FHEUtil*)this->fheUtil)->plainMatMul(A, B, dim0, dim1, dim2);
+}
+
+std::vector<std::vector<uint64_t>> FHEWrapper::plainMatMul(const std::vector<std::vector<uint64_t>>& A, const std::vector<std::vector<uint64_t>>& B) {
+    KernelProvider::initialize();
+    size_t dim0 = A.size();
+    size_t dim1 = A[0].size();
+    size_t dim2 = B[0].size();
+    std::vector<uint64_t> flat_A(dim0 * dim1);
+    std::vector<uint64_t> flat_B(dim1 * dim2);
+    std::vector<uint64_t> flat_C(dim0 * dim2);
+    for (size_t i = 0; i < dim0; ++i) {
+        for (size_t j = 0; j < dim1; ++j) {
+            flat_A[i*dim1 + j] = A[i][j];
+        }
+    }
+    for (size_t i = 0; i < dim1; ++i) {
+        for (size_t j = 0; j < dim2; ++j) {
+            flat_B[i*dim2 + j] = B[i][j];
+        }
+    }
+    flat_C = ((FHEUtil*)this->fheUtil)->plainMatMul(flat_A, flat_B, dim0, dim1, dim2);   
+    std::vector<std::vector<uint64_t>> C(dim0, std::vector<uint64_t>(dim2, 0));
+    for (size_t i = 0; i < dim0; ++i) {
+        for (size_t j = 0; j < dim2; ++j) {
+            C[i][j] = flat_C[i*dim2 + j];
+        }
+    }
+    return C;
+}
+
+string FHEWrapper::serialize_pub_key(size_t& pk_size, size_t& gk_size, size_t& autok_size) {
+    KernelProvider::initialize();
+    return ((FHEUtil*)this->fheUtil)->serialize_pub_key(pk_size, gk_size, autok_size);
+}
+
+void FHEWrapper::deserialize_pub_key(const string& buf, size_t pk_size_, size_t gk_size_, size_t autok_size_) {
+    KernelProvider::initialize();
+    ((FHEUtil*)this->fheUtil)->deserialize_pub_key(buf, pk_size_, gk_size_, autok_size_);
+}
+
+std::string FHEWrapper::encrypt(const std::vector<uint64_t>& plain) {
+    KernelProvider::initialize();
+    return ((FHEUtil*)this->fheUtil)->encrypt(plain);
+}
+
+std::string FHEWrapper::encrypt(const std::vector<std::vector<uint64_t>>& plain, size_t dim0, size_t dim1, size_t dim2, bool isLeft) {
+    KernelProvider::initialize();
+    return ((FHEUtil*)this->fheUtil)->encrypt(plain, dim0, dim1, dim2, isLeft);
+}
+
+std::vector<std::vector<uint64_t>> FHEWrapper::mat_mul_and_subtract_random(std::string& cipher, const std::vector<std::vector<uint64_t>>& operand, size_t dim0, size_t dim1, size_t dim2, bool isLeft) {
+    KernelProvider::initialize();
+    return ((FHEUtil*)this->fheUtil)->mat_mul_and_subtract_random(cipher, operand, dim0, dim1, dim2, isLeft);
+}
+
+std::vector<uint64_t> FHEWrapper::subtract_random(std::string& cipher, size_t dim) {
+    KernelProvider::initialize();
+    return ((FHEUtil*)this->fheUtil)->subtract_random(cipher, dim);
+}
+
+std::vector<std::vector<uint64_t>> FHEWrapper::decrypt(const std::string& cipher, size_t dim0, size_t dim1, size_t dim2, bool isLeft) {
+    KernelProvider::initialize();
+    return ((FHEUtil*)this->fheUtil)->decrypt(cipher, dim0, dim1, dim2, isLeft);
+}
+
+std::vector<uint64_t> FHEWrapper::decrypt(const std::string& cipher, size_t dim) {
+    KernelProvider::initialize();
+    return ((FHEUtil*)this->fheUtil)->decrypt(cipher, dim);
+}

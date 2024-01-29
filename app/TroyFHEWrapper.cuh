@@ -1,0 +1,29 @@
+#pragma once
+
+#include <string>
+#include <vector>
+
+namespace troyn {
+    class FHEWrapper {
+        void *fheUtil;
+
+    public:
+        FHEWrapper(bool isPriv = true);
+        ~FHEWrapper();
+
+        std::vector<uint64_t> plainMatMul(const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, size_t dim0, size_t dim1, size_t dim2);
+        std::vector<std::vector<uint64_t>> plainMatMul(const std::vector<std::vector<uint64_t>>& A, const std::vector<std::vector<uint64_t>>& B);
+
+        std::string serialize_pub_key(size_t& pk_size, size_t& gk_size, size_t& autok_size);
+        void deserialize_pub_key(const std::string& buf, size_t pk_size_, size_t gk_size_, size_t autok_size_);
+
+        std::string encrypt(const std::vector<uint64_t>& plain);
+        std::string encrypt(const std::vector<std::vector<uint64_t>>& plain, size_t dim0, size_t dim1, size_t dim2, bool isLeft = true);
+        std::vector<std::vector<uint64_t>> mat_mul_and_subtract_random(std::string& cipher, const std::vector<std::vector<uint64_t>>& operand, size_t dim0, size_t dim1, size_t dim2, bool isLeft = true);
+        std::vector<uint64_t> subtract_random(std::string& cipher, size_t dim);
+        std::vector<uint64_t> mul_scaler_and_subtract_random(std::string& cipher, uint64_t scaler, size_t dim);
+        std::vector<uint64_t> add_and_mul_scaler_and_subtract_random(std::string& cipher, const std::vector<uint64_t>& addend, uint64_t scaler, size_t dim);
+        std::vector<std::vector<uint64_t>> decrypt(const std::string& cipher, size_t dim0, size_t dim1, size_t dim2, bool isLeft = true);
+        std::vector<uint64_t> decrypt(const std::string& cipher, size_t dim);
+    };
+};
